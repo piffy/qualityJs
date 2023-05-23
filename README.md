@@ -1,1 +1,1 @@
-# qualityJs
+# Prove di refactoring JS
