@@ -1,0 +1,356 @@
+var auth = require('./cfg/auth.js');
+var sfdc = require('./sfdc.js');
+var fixCountries = require('./fix-countries.js');
+const csv = require('csv-parser');
+const fs = require('fs');
+const convert = (from, to) => str => Buffer.from(str, from).toString(to)
+const cp850utf8 = convert('CP850', 'utf-8');
+
+var cfg={
+    0: "Account_code__c", //codice cliente
+    30: "Categoria__c",
+    31: "Ramo_Geografia_1__c",
+    32: "Ramo_Geografia_2__c",
+    33: "Channel__c",
+    34: "SubChannel__c",
+    35: "Segment__c",
+    36: "SubSegment__c",
+    37: "Campo_calcolato_security__c"
+};
+var agenti = [];
+var gruppoAcquisto = [];
+var area = [];
+var state = [];
+var categoria = [];
+var agentDescription = [];
+var mercato = [];
+var stateReason = [];
+var regex_1 = '/[^\x20-\x27\x2D-\x39\x40-\x5A\x61-\x7A\xC0-\xFF]/';
+var regex_2 = '/[^\x20-\x2C\x2D-\x5A\x61-\x7A\xC0-\xFF]/';
+
+//
+// the job
+//
+
+function doJob() {
+    getUser().then(function() {
+        console.log(agenti);
+        //Gruppo di Acquisto
+        getGruppoAcquisto().then( function () {
+            //array associativo area
+            //apro l'opportuna directory in base alla country con cui sto lavorando
+            getArea().then( function () {
+                //array associativo state
+                //apro l'opportuna directory in base alla country con cui sto lavorando
+                getState().then( function () {
+                    //array associativo categoria
+                    //apro l'opportuna directory in base alla country con cui sto lavorando
+                    getCategoria().then( function () {
+                        //array associativo agent description
+                        //apro l'opportuna directory in base alla country con cui sto lavorando
+                        getAgentDescription().then( function () {
+                            //array associativo mercato
+                            //apro l'opportuna directory in base alla country con cui sto lavorando
+                            getMercato().then( function () {
+                                //array associativo state reason
+                                //apro l'opportuna directory in base alla country con cui sto lavorando
+                                getStateReason().then( function () {
+                                    //carico gli account dell country selezionata
+                                    doReadFile();
+                                })
+                            })
+                        })
+                    })
+                })
+            })
+        })
+    })
+}
+
+function getUser() {
+    var soql="select id, UserName, FirstName, LastName, Codice_paese__c, IsActive, Codice_agente__c from user where isactive=true and Codice_paese__c='IT' and  Codice_agente__c!=Null";
+
+    return new Promise(function(resolve, reject) {
+        sfdc.doQuery(sfdc, soql).then(async function(resp) {
+            gestioneUser(resp);
+			while (resp.nextRecordsUrl){
+				resp = await sfdc.query(sfdc.credentials, resp.nextRecordsUrl, true);
+				gestioneUser(resp);
+			}
+            
+            return resolve();
+        })
+    })
+}
+
+function gestioneUser(resp) {
+	if (resp.records) {
+		for(var i =0; i<resp.records.length; i++) {
+			let r = resp.records[i];
+			if( r.Codice_Agente__c ) {
+                var arrayCodiciAgenti = r.Codice_Agente__c.split(',') ;
+                for(var ind =0; ind<arrayCodiciAgenti.length; ind++) {
+                    var valoreChiave = arrayCodiciAgenti[ind];
+                    agenti[valoreChiave]=r.Id; // agenti è un array [] associativo mappa
+                }
+            }
+		}
+	}
+}
+
+//
+// file loader
+//
+
+function doReadFile() {
+    var irow=0;
+    var oldkey="";
+    // open file
+    fs.createReadStream( auth.filePath + 'FTP_CRM/CRMCLIE.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+    .on('data', function (line) {
+        //if (irow>0) return;
+        //console.log('Line from file:'+irow+' '+JSON.stringify(line));
+
+        var sf=parseRecord(line);
+
+        sf=doTransform(sf, line);
+        if (sf.Account_code__c != oldkey) {
+            console.log(JSON.stringify(sf,null,2));
+            sfdc.doUpsert(sfdc, 'Account', 'Account_code__c', sf);
+        }
+        oldkey=sf.Account_code__c;
+        irow++;
+    })
+    .on('end', () => {
+        console.log('flush');
+        sfdc.doUpsert(sfdc, 'Account', 'Account_code__c');
+    });        
+}
+
+function getGruppoAcquisto() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_Gacq.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line[0].trim());
+            gruppoAcquisto[line[0].trim()]=line[1].toString().trim();
+        })
+        .on('end', () => {
+            console.log('flush', gruppoAcquisto);
+            return resolve();
+        });    
+    })    
+}
+
+function getArea() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_AREA.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            area[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', area);
+            return resolve();
+        });    
+    })    
+}
+
+function getState() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_CLISTA.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            state[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', state);
+            return resolve();
+        });    
+    })    
+}
+
+function getCategoria() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_TPCLI.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            categoria[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', categoria);
+            return resolve();
+        });    
+    })    
+}
+
+function getAgentDescription() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_AGENT.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            agentDescription[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', agentDescription);
+            return resolve();
+        });    
+    })    
+}
+
+function getMercato() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_MERC.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            mercato[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', mercato);
+            return resolve();
+        });    
+    })    
+}
+
+function getStateReason() {
+    return new Promise(function(resolve, reject) {
+        // open file 
+        fs.createReadStream( auth.filePath + 'FTP_CRM/CRM_MOTSCL.CSV' , {encoding: 'utf-8'}).pipe(csv({separator: ';', escape:'', quote:'"', headers: false}))
+        .on('data', function (line) {
+            //console.log('Line from file ', line);
+            stateReason[line[0].trim()]=line[1].trim();
+        })
+        .on('end', () => {
+            console.log('flush', stateReason);
+            return resolve();
+        });    
+    })    
+}
+
+//
+// transform
+//
+
+function doTransform(sf, data) {
+    sf.Name=Buffer.from(data[1].replace(regex_1,'').trim(),'utf-8').toString();//ragione sociale
+    sf.BillingStreet=Buffer.from(data[2].replace(regex_2,'').trim(),'utf-8').toString(); //indirizzo
+    sf.BillingCity=Buffer.from(data[3].replace(regex_1,'').trim(),'utf-8').toString();
+    sf.BillingPostalCode=Buffer.from(data[4].replace(regex_1,'').trim(),'utf-8').toString();
+
+    if (data[5].trim().length > 0)
+        sf.BillingState= Buffer.from(data[5].trim(),'utf-8').toString();
+        
+    sf.BillingCountry= Buffer.from( fixCountries.fixCountries(data[6],fixCountries.countries) ,'utf-8').toString(); // <--------------------- BillingCountry modified
+    sf.Vat_number__c= Buffer.from(data[7].replace(regex_1,'').trim(),'utf-8').toString();
+    sf.Tax_Code__c= data[8].replace(regex_1,'').trim();
+    sf.Phone= data[9].replace(regex_1,'').trim();
+    sf.Fax= data[10].replace(regex_1,'').trim();
+    sf.Agent__c= data[11].replace(regex_1,'').trim();
+    sf.Zone__c= data[12].replace(regex_1,'').trim(); 
+    sf.Market__c= data[13].replace(regex_1,'').trim(); 
+    sf.State__c= data[14].replace(regex_1,'').trim(); 
+    sf.State_Reason__c= data[15].replace(regex_1,'').trim(); 
+    sf.category__c= data[16].replace(regex_2,'').trim(); 
+    sf.Sconto_1__c= data[17].replace(regex_2,'').trim();
+    sf.Sconto_2__c= data[18].replace(regex_2,'').trim(); 
+    sf.Sconto_3__c= data[19].replace(regex_2,'').trim(); 
+    sf.Pagamento_1__c= Buffer.from(data[20].replace(regex_2,'').trim(),'utf-8').toString();
+    sf.Pagamento_2__c= Buffer.from(data[21].replace(regex_2,'').trim(),'utf-8').toString(); 
+    sf.Giorni_Fissi_1__c= data[22].replace(regex_1,'').trim();  
+    sf.Giorni_Fissi_2__c= data[23].replace(regex_1,'').trim();
+    sf.Giorni_Fissi_3__c= data[24].replace(regex_1,'').trim(); 
+    sf.Gruppo__c= data[28].replace(regex_1,'').trim();
+    sf.Sconto_1__c= sf.Sconto_1__c.replace(',','.'); 
+    sf.Sconto_2__c= sf.Sconto_2__c.replace(',','.'); 
+    sf.Sconto_3__c= sf.Sconto_3__c.replace(',','.'); 
+    sf.Email_Commerciale__c= Buffer.from(data[25].replace('/[^A-Za-z0-9@. -]/','').trim(),'utf-8').toString(); 
+    sf.Email_Logistica__c= Buffer.from(data[26].replace('/[^A-Za-z0-9@. -]/','').trim(),'utf-8').toString(); 
+    sf.Email_Contabilita__c= Buffer.from(data[27].replace('/[^A-Za-z0-9@. -]/','').trim(),'utf-8').toString();
+    
+    sf.OwnerId='00558000000K2zM';
+    
+    if (agenti.hasOwnProperty(sf.Agent__c)) {
+      console.log(agenti[sf.Agent__c]);
+      sf.OwnerId=agenti[sf.Agent__c];
+    }
+
+    //associo gruppo acquisto
+    if (gruppoAcquisto.hasOwnProperty(sf.Gruppo__c))
+        sf.Gruppo_di_Acquisto__c=sf.Gruppo__c + " - " + gruppoAcquisto[sf.Gruppo__c];
+        
+    if (state.hasOwnProperty(sf.State__c))
+        sf.State__c=sf.State__c + " - " + state[sf.State__c];
+            
+    if (categoria.hasOwnProperty(sf.category__c))
+        sf.category__c=sf.category__c + " - " + categoria[sf.category__c];
+        
+    if (mercato.hasOwnProperty(sf.Market__c))
+        sf.Market_Description__c=sf.Market__c + " - " + mercato[sf.Market__c];
+        
+    if (agentDescription.hasOwnProperty(sf.Agent__c))
+        sf.Agent_description__c=sf.Agent__c + " - " + agentDescription[sf.Agent__c];
+        
+    if (stateReason.hasOwnProperty(sf.State_Reason__c))
+        sf.State_Reason__c=stateReason[sf.State_Reason__c];
+        
+    if (area.hasOwnProperty(sf.Zone__c))
+        sf.Zone_description__c=sf.Zone__c + " - " + area[sf.Zone__c];
+
+    return sf;
+}
+
+//
+// utility functions
+//
+
+function formatdata(sqldata) {
+    return sqldata.substr(6,4) +'-'+sqldata.substr(3,2)+'-'+sqldata.substr(0,2);
+}
+
+function formatnumber(sqldata) {
+    if (!sqldata) return sqldata;
+    return sqldata.replace(/,/g,"");
+}
+
+function parseRecord(r) {
+    var sf={};
+    for (var [k,v] of Object.entries(r)) {
+        var v2=v.trim();
+        if (v2) {
+            var s2=cfg[k]; // il campo corrispondente in salesforce
+            if (s2) {
+                sf[s2]=Buffer.from(v2,'utf-8').toString();
+            }
+        }
+    }
+    return sf;
+}
+
+//
+// main program
+//
+
+sfdc.getSalesforceToken().then(function (c) {
+    console.log('auth data recovered');
+    sfdc.credentials = c;
+    doJob();
+}).catch(function (err) {
+    console.log('auth data NOT recovered');
+    console.log(err);
+})
+
+/*
+var express = require('express');
+var app = express();
+app.listen(3000);
+
+// oauth2 callback
+app.get('/auth', function(req, res) {
+    sfdc.manageSalesforceCallback(req, res);
+  });
+*/

@@ -1,0 +1,382 @@
+var auth = require('./cfg/auth.js');
+var sfdc = require('./sfdc.js');
+var sfdcbatch = require('./sfdcbatch.js');
+const csv = require('csv-parser');
+const fs = require('fs');
+var numeral = require('numeral');
+const process = require('process');
+var moment = require('moment');
+
+//Num Name          Collection      Net Shipped    Projection     Var %       Net RX      Net SLSP    Ret Units     Ret %   Projection    Net Shipped     Projection     Var %   LQTD Net Shp   LY Var%       Net RX       Net SLSP    Ret Units     Ret %  NumCust
+var cfg={
+    "Collection": "nomebrand",
+    "Num": "Salesrep_Unique_Code__c",
+    "Name": "NameSalesRep",
+    "Net Shipped": "Net_Amount__c",
+    "Var %": "Variability_MTD__c",
+    "Net RX": "Net_RX_MTD__c",
+    "Net SLSP": "Net_SLSP_MTD__c",
+    "Ret Units": "Return_Qty__c",
+    "Ret %": "Return_MTD__c",
+    "Net Shipped2": "Net_Amount_QTD__c",
+    "Var %2": "Variability_QTD__c",
+    "LQTD Net Shp": "Net_Amount_LQTD__c",
+    "LY Var%": "Variability_LY_QTD__c",
+    "Net RX2": "Net_RX_QTD__c",
+    "Net SLSP2": "Net_SLSP_QTD__c",
+    "Ret Units2": "Return_Qty_QTD__c",
+    "Ret %2": "Return_QTD__c",
+    "NumCust": "NumCust_QTD__c",
+};
+
+var cfgbulk=[
+    "Name",
+    "Record_Key__c",
+    "Period__c",
+
+    //"Sold_to__r.Customer_Unique_Code__c",
+
+    "Salesrep_Unique_Code__c",
+    "Net_Amount__c",
+    "Variability_MTD__c",
+    "Net_RX_MTD__c",
+    "Net_SLSP_MTD__c",
+    "Return_Qty__c",
+    "Return_MTD__c",
+    "Net_Amount_QTD__c",
+    "Variability_QTD__c",
+    "Net_Amount_LQTD__c",
+    "Variability_LY_QTD__c",
+    "Net_RX_QTD__c",
+    "Net_SLSP_QTD__c",
+    "Return_Qty_QTD__c",
+    "Return_QTD__c",
+    "NumCust_QTD__c",
+    "Brand__r.Code__c",
+];
+
+var mapBrand=[];
+var stra = false;
+if(process.argv[3]) stra = process.argv[3];
+var filename = process.argv[2];
+var perioddate='';
+
+//--------------
+// the job
+//--------------
+
+function doJob() {
+    getRecords().then( function() {
+        doReadFile();
+    });
+    
+}
+
+//--------------
+// extract records
+//--------------
+
+function getRecords() {
+    var soql=" SELECT id, Name, Code__c FROM Brand__c  WHERE Organization_Code__c ='USA' ";
+
+    return new Promise(function(resolve, reject) {
+        sfdc.doQuery(sfdc, soql).then(async function(resp) {
+            gestioneRecords(resp);
+			while (resp.nextRecordsUrl){
+				resp = await sfdc.query(sfdc.credentials, resp.nextRecordsUrl, true);
+				gestioneRecords(resp);
+			}
+            
+            return resolve();
+        })
+    })
+}
+
+function gestioneRecords(resp) {
+	if (resp.records) {
+		for(var i =0; i<resp.records.length; i++) {
+			let r = resp.records[i];
+            //console.log(r)
+            mapBrand[r.Name]=r;
+		}
+	}
+}
+
+//--------------
+// file loader
+//--------------
+
+function doReadFile() {
+    var irow=0;
+    var irowskip=0;
+    var fdate1={pos:0,len:11};
+    var fdate2={pos:123,len:10};
+    var regex_date=/\d{1,2}-\w{3}-\d{4}/;
+
+    // open file
+    fs.readFile(auth.filePath+'/'+ filename, 'utf-8',async (err, data) => {
+        let array=data.split('\r\n')
+        for(var i=0; i<array.length;i++){
+            var line=array[i];
+
+            // console.log('Line:',line);
+
+            // look for report period
+            var dateRow2=getfield(fdate2,line);
+            if (regex_date.test(dateRow2)) {
+                perioddate = new moment(dateRow2,'DD-MMM-YYYY');
+                // console.log('->'+irow+': perioddate='+perioddate.format('YYYY-MM-DD'));
+                irowskip++; continue; 
+            }
+            
+            // look for report date
+            var dateRow=getfield(fdate1,line);
+            if (regex_date.test(dateRow)) {
+                var reportdate = new moment(dateRow,'DD-MMM-YYYY');
+                // console.log('->'+irow+': reportdate='+reportdate.format('YYYY-MM-DD'));
+                irowskip++; continue; 
+            }
+
+            var repcode=getfield(fields[0],line);
+            var repname=getfield(fields[1],line);
+            var reptotal=getfield(fields[2],line);
+
+            // skip non data lines
+            if (line=='' || repcode<=0 || repname=='Total' || repname=='Region' || reptotal=='Total') { 
+                irowskip++; continue; 
+            }
+            
+            //if (irow>0) break;
+            irow++;
+            if ((irow % 1000)==0) console.log(irow);
+
+            //console.log('Line from file:'+irow+'\n',line);
+            // console.log('->'+irow+': repcode='+repcode+' '+'repname=>'+repname+'< '+'reptotal=>'+reptotal+'< '+line);
+
+            var row=decodeLine(line);
+            // console.log(JSON.stringify(row,null,2));
+
+            var sf=parseRecord(row);
+            sf=doTransform(sf);
+    
+            console.log(JSON.stringify(sf,null,2));
+
+            sfdc.doUpsert(sfdc, 'Order__c', 'Record_Key__c', sf);
+        }
+        console.log('flush, rows:' + irow + '\nrows skip:' + irowskip);
+        
+        sfdc.doUpsert(sfdc, 'Order__c', 'Record_Key__c');
+    })       
+}
+
+//--------------
+// transform
+//--------------
+//MTD= fatturato del mese ad oggi
+//YTD= fatturato dell'anno ad oggi
+function doTransform(sf) {
+    
+    var brandCode='';
+    if(mapBrand[sf.nomebrand]) {
+        brandCode=mapBrand[sf.nomebrand].Code__c;
+    } else {
+        console.log(sf.nomebrand)
+        if(sf.nomebrand=='POLAROID') brandCode='PLD';
+        if(sf.nomebrand=='BOSS') brandCode='BS';
+    }
+
+    if (brandCode) sf.Brand__r = { Code__c: brandCode };
+
+    sf.Period__c=perioddate.format('YYYY-MM-DD');
+    sf.Name='Q-' + perioddate.format('YYYYMM') + '-' + sf.Salesrep_Unique_Code__c + '-' + brandCode;
+    if(stra=='true')  sf.Name += '-S'
+
+    sf.Record_Key__c=sf.Name;
+    sf.isQuarter__c=true;
+    delete sf.nomebrand;
+    delete sf.NameSalesRep;
+
+    sf.Salesrep_Unique_Code__c = 'USA-' + sf.Salesrep_Unique_Code__c;
+
+    /*
+    if(sf.Net_Amount__c) sf.Net_Amount__c = parseFloat(sf.Net_Amount__c);
+    if(sf['Variability_MTD__c']) sf['Variability_MTD__c'] = parseFloat(sf['Variability_MTD__c']);
+    if(sf.Net_RX_MTD__c) sf.Net_RX_MTD__c = parseFloat(sf.Net_RX_MTD__c);
+    if(sf.Net_SLSP_MTD__c) sf.Net_SLSP_MTD__c = parseFloat(sf.Net_SLSP_MTD__c);
+    if(sf.Return_Qty__c) sf.Return_Qty__c = parseFloat(sf.Return_Qty__c);
+    if(sf['Return_MTD__c']) sf['Return_MTD__c'] = parseFloat(sf['Return_MTD__c']);
+    if(sf.Net_Amount_QTD__c) sf.Net_Amount_QTD__c = parseFloat(sf.Net_Amount_QTD__c);
+    if(sf['Variability_QTD__c']) sf['Variability_QTD__c'] = parseFloat(sf['Variability_QTD__c']);
+    if(sf.Net_Amount_LQTD__c) sf.Net_Amount_LQTD__c = parseFloat(sf.Net_Amount_LQTD__c);
+    if(sf['Variability_LY_QTD__c']) sf['Variability_LY_QTD__c'] = parseFloat(sf['Variability_LY_QTD__c']);
+    if(sf.Net_RX_QTD__c) sf.Net_RX_QTD__c = parseFloat(sf.Net_RX_QTD__c);
+    if(sf.Net_SLSP_QTD__c) sf.Net_SLSP_QTD__c = parseFloat(sf.Net_SLSP_QTD__c);
+    if(sf.Return_Qty_QTD__c) sf.Return_Qty_QTD__c = parseFloat(sf.Return_Qty_QTD__c);
+    if(sf['Return_QTD__c']) sf['Return_QTD__c'] = parseFloat(sf['Return_QTD__c']);
+    if(sf.NumCust_QTD__c) sf.NumCust_QTD__c = parseFloat(sf.NumCust_QTD__c);
+    */
+
+    if(stra=='true') {
+        sf.STRA__c=true;
+
+        if(sf.Net_Amount__c)        sf.Net_Amount__c *= -1;
+        if(sf.Variability_MTD__c)   sf.Variability_MTD__c *= -1;
+        if(sf.Net_RX_MTD__c)        sf.Net_RX_MTD__c *= -1;
+        if(sf.Net_SLSP_MTD__c)      sf.Net_SLSP_MTD__c *= -1;
+        if(sf.Return_Qty__c)        sf.Return_Qty__c *= -1;
+        if(sf.Return_MTD__c)        sf.Return_MTD__c *= -1;
+        if(sf.Net_Amount_QTD__c)    sf.Net_Amount_QTD__c *= -1;
+        if(sf.Variability_QTD__c)   sf.Variability_QTD__c *= -1;
+        if(sf.Net_Amount_LQTD__c)   sf.Net_Amount_LQTD__c *= -1;
+        if(sf.Variability_LY_QTD__c) sf.Variability_LY_QTD__c *= -1;
+        if(sf.Net_RX_QTD__c)        sf.Net_RX_QTD__c *= -1;
+        if(sf.Net_SLSP_QTD__c)      sf.Net_SLSP_QTD__c *= -1;
+        if(sf.Return_Qty_QTD__c)    sf.Return_Qty_QTD__c *= -1;
+        if(sf.Return_QTD__c)        sf.Return_QTD__c *= -1;
+        if(sf.NumCust_QTD__c)       sf.NumCust_QTD__c *= -1;
+    }
+
+    return sf;
+}
+
+//--------------
+// utility functions
+//--------------
+
+function formatdata(sqldata) {
+    return sqldata.substr(6,4) +'-'+sqldata.substr(3,2)+'-'+sqldata.substr(0,2);
+}
+
+function formatnumber(sqldata) {
+    if (!sqldata) return sqldata;
+    if (sqldata.substr(-1,1)=='-') sqldata='-'+sqldata.substr(0,sqldata.length-1);
+    return parseFloat(sqldata.replace(/,/g,""));
+}
+
+function parseRecord(r) {
+    var sf={};
+    for (const [k,v] of Object.entries(r)) {
+        var s2=cfg[k]; // il campo corrispondente in salesforce
+        if (s2) {
+            sf[s2]='';
+            if (v) {
+                if (typeof v==String) {
+                    /*global Buffer*/
+                    sf[s2]=Buffer.from(v,'utf-8').toString();
+                } else {
+                    sf[s2]=v;
+                }
+            }
+        }
+    }
+    return sf;
+}             
+
+var fields=[
+    { name:'Num', pos: 0, len:3, isnum:true},
+    { name:'Name', pos: 4, len:14},
+    { name:'Collection', pos: 18, len:15 },
+    { name:'Net Shipped', pos: 34, len:12, isnum:true},
+    { name:'Projection', pos: 47, len:12, isnum:true},
+    { name:'Var %', pos: 60, len:10, isnum:true},
+    { name:'Net RX', pos: 71, len:12, isnum:true},
+    { name:'Net SLSP', pos: 85, len:12, isnum:true},
+    { name:'Ret Units', pos: 98, len:12, isnum:true},
+    { name:'Ret %', pos: 111, len:8, isnum:true},
+    { name:'Projection2', pos: 120, len:12, isnum:true},
+    { name:'Net Shipped2', pos: 134, len:14, isnum:true},
+    { name:'Projection3', pos: 149, len:14, isnum:true},
+    { name:'Var %2', pos: 163, len:10, isnum:true},
+    { name:'LQTD Net Shp', pos: 174, len:14, isnum:true},
+    { name:'LY Var%', pos: 190, len:8, isnum:true},
+    { name:'Net RX2', pos: 199, len:12, isnum:true},
+    { name:'Net SLSP2', pos: 212, len:14, isnum:true},
+    { name:'Ret Units2', pos: 227, len:12, isnum:true},
+    { name:'Ret %2', pos: 240, len:8, isnum:true},
+    { name:'NumCust', pos: 249, len:8, isnum:true},
+]
+
+function getfield(f,line) {
+
+    // console.log('name:'+f.name+' line:'+line);
+
+    var v=line.substr(f.pos,f.len).trim();
+    if (f.isnum) {
+        v=formatnumber(v);
+        if (isNaN(v)) v='';
+    }
+    return v;
+}
+
+function decodeLine(line) {
+    var sf={};
+
+    fields.forEach((f) => {
+        sf[f.name]=getfield(f,line);
+    })
+
+    /*
+    sf.Num = line.substr(0,3).trim();
+    sf.Name = line.substr(4,14).trim();
+    sf.Collection = line.substr(18,15).trim().replace(/,/g,'');
+    sf['Net Shipped'] = line.substr(34,14).trim().replace(/,/g,'');
+    sf.Projection = line.substr(48,14).trim().replace(/,/g,'');
+    sf['Var %'] = line.substr(63,10).trim().replace(/,/g,'');
+    sf['Net RX'] = line.substr(75,12).trim().replace(/,/g,'');
+    sf['Net SLSP'] = line.substr(87,12).trim().replace(/,/g,'');
+    sf['Ret Units'] = line.substr(99,14).trim().replace(/,/g,'');
+    sf['Ret %'] = line.substr(113,8).trim().replace(/,/g,'');
+    sf['Projection2'] = line.substr(121,14).trim().replace(/,/g,'');
+    sf['Net Shipped2'] = line.substr(135,16).trim().replace(/,/g,'');
+    sf['Projection3'] = line.substr(151,15).trim().replace(/,/g,'');
+    sf['Var %2'] = line.substr(166,8).trim().replace(/,/g,'');
+    sf['LQTD Net Shp'] = line.substr(174,15).trim().replace(/,/g,'');
+    sf['LY Var%'] = line.substr(189,14).trim().replace(/,/g,'');
+    sf['Net RX2'] = line.substr(203,13).trim().replace(/,/g,'');
+    sf['Net SLSP2'] = line.substr(216,12).trim().replace(/,/g,'');
+    sf['Ret Units2'] = line.substr(228,14).trim().replace(/,/g,'');
+    sf['Ret %2'] = line.substr(242,7).trim().replace(/,/g,'');
+    sf['NumCust'] = line.substr(249,8).trim().replace(/,/g,'');
+
+    for (const [k,v] of Object.entries(sf)) {
+        if(v=='') {delete sf[k];
+        } else {
+            if(v.substr(-1)=='-') {
+                sf[k]='-' + v.substr(0,v.length-1);
+            }
+        }
+    }
+    */
+
+    return sf;
+}
+
+//--------------
+// main program
+//--------------
+
+sfdc.getSalesforceToken().then(function (c) {
+    console.log('auth data recovered');
+    sfdc.credentials = c;
+    // sfdc.nrows=1;
+    doJob();
+}).catch(function (err) {
+    console.log('auth data NOT recovered');
+    console.log(err);
+})
+
+//--------------
+// get tocken
+//--------------
+/*
+var express = require('express');
+var app = express();
+app.use('/',express.static('app'));
+app.use(express.json({limit: '50mb'}));
+app.use(express.urlencoded({limit: '50mb'}));
+app.listen(3000);
+// oauth2 callback
+app.get('/auth', function(req, res) {
+    sfdc.manageSalesforceCallback(req, res);
+});
+*/
